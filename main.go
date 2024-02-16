@@ -11,8 +11,10 @@ import (
 
 const (
 	// These should be set to control the book that is downloaded.
-	Language = "Spanish"
-	BookName = "Complete Spanish Step-by-Step"
+	DesiredLanguage = "Spanish"
+	DesiredBookName = "Complete Spanish Step-by-Step"
+
+	DownloadAllBooks = false
 )
 
 const (
@@ -20,6 +22,7 @@ const (
 	GetMenuUrl          = "https://mhe-language-lab.azurewebsites.net/api/GetSubMenus?parentID=%d"
 	GetFlashCardsUrl    = "https://mhe-language-lab.azurewebsites.net/api/GetFlashCards?menuID=%d"
 	FlashCards          = "Flashcards"
+	ProgressChecks      = "Progress Checks"
 	FlashCardsStudyMode = "Flashcards: Study Mode"
 	FileStart           = `#separator:tab
 #html:true
@@ -35,44 +38,54 @@ func main() {
 }
 func DoEverything() error {
 	// Get the list of languages and select the desired language.
-	languageMenu, err := GetMenu(0)
+	languageMenu, err := GetMenuOptions(0)
 	if err != nil {
 		return err
 	}
-	var languageId int
 	for _, languageEntry := range languageMenu {
-		if languageEntry.MenuTitle == Language {
-			languageId = languageEntry.MenuID
-			break
+		if DownloadAllBooks || languageEntry.MenuTitle == DesiredLanguage {
+			fmt.Printf("Downloading flashcards for language %s\n", languageEntry.MenuTitle)
+			err = DownloadFlashCardsForLanguage(languageEntry)
+			if err != nil {
+				return err
+			}
 		}
 	}
-
+	return nil
+}
+func DownloadFlashCardsForLanguage(language *MenuEntry) error {
 	// Get the list of books for the selected language and select the desired book.
-	bookMenu, err := GetMenu(languageId)
+	bookMenu, err := GetMenuOptions(language.MenuID)
 	if err != nil {
 		return err
 	}
-	var bookId int
 	for _, bookEntry := range bookMenu {
-		if bookEntry.MenuTitle == BookName {
-			bookId = bookEntry.MenuID
-			break
+		if DownloadAllBooks || bookEntry.MenuTitle == DesiredBookName {
+			fmt.Printf("Downloading flashcards for book %s\n", bookEntry.MenuTitle)
+			err = DownloadFlashCardsForBook(language, bookEntry)
+			if err != nil {
+				return err
+			}
 		}
+	}
+	return nil
+}
+
+func DownloadFlashCardsForBook(language, book *MenuEntry) error {
+	// Get the chapters of the book and download the flashcards.
+	// For each book, there are multiple options. Ones called "Flashcards" and "Progress Checks" are compatible with flashcards.
+	// There are some books that don't have either of those. In that case, the book is not compatible with this program.
+	flashCardOption, err := GetMenuOptionWithNames(book.MenuID, FlashCards, ProgressChecks)
+	if err != nil {
+		return err
+	}
+	if flashCardOption == nil {
+		fmt.Printf("Book %s does not have flashcards or progress checks\n", book.MenuTitle)
+		return nil
 	}
 
-	// Get the chapters of the book and download the flashcards.
-	bookOptions, err := GetMenu(bookId)
-	if err != nil {
-		return err
-	}
-	var flashCardId int
-	for _, options := range bookOptions {
-		if options.MenuTitle == FlashCards {
-			flashCardId = options.MenuID
-			break
-		}
-	}
-	chapters, err := GetMenu(flashCardId)
+	// Flash cards will return a list of chapters. Which might have subchapters or may lead directly to flashcards.
+	chapters, err := GetMenuOptions(flashCardOption.MenuID)
 	if err != nil {
 		return err
 	}
@@ -84,6 +97,11 @@ func DoEverything() error {
 	fileOutput := strings.Builder{}
 	fileOutput.WriteString(FileStart)
 	for _, chapter := range chapters {
+		// Download the flashcards for the whole chapter, including subchapters.
+		chapterCards, err := GetChapterCards(chapter)
+		if err != nil {
+			return err
+		}
 		// Make 1-digit numbers start with zero, so that alphabetical sorting works correctly.
 		if chapter.MenuTitle[1] == '.' {
 			chapter.MenuTitle = "0" + chapter.MenuTitle
@@ -92,76 +110,98 @@ func DoEverything() error {
 		chapter.MenuTitle = strings.ReplaceAll(chapter.MenuTitle, "<i>", "")
 		chapter.MenuTitle = strings.ReplaceAll(chapter.MenuTitle, "</i>", "")
 
-		fmt.Printf("%+v\n", chapter.MenuTitle)
-		// Get all sections in the chapter and get the study mode flashcards in each section.
-		sections, err := GetMenu(chapter.MenuID)
+		fmt.Printf("Chapter: %v\n", chapter.MenuTitle)
+
+		// Write the flashcards to the file, one for Spanish to English and one for English to Spanish.
+		for _, card := range chapterCards {
+			title := chapter.MenuTitle
+			if chapter.MenuTitle[2:4] == ". " {
+				title = chapter.MenuTitle[0:4] + "(" + language.MenuTitle[0:1] + "2E) " + chapter.MenuTitle[4:]
+			}
+			fileOutput.WriteString(fmt.Sprintf("%s\t%s\t%s %s\n", card.SideA, card.SideB, book.MenuTitle, title))
+		}
+		for _, card := range chapterCards {
+			title := chapter.MenuTitle
+			if chapter.MenuTitle[2:4] == ". " {
+				title = chapter.MenuTitle[0:4] + "(E2" + language.MenuTitle[0:1] + ") " + chapter.MenuTitle[4:]
+			}
+			fileOutput.WriteString(fmt.Sprintf("%s\t%s\t%s %s\n", card.SideB, card.SideA, book.MenuTitle, title))
+		}
+	}
+	if fileOutput.Len() == len(FileStart) {
+		fmt.Printf("No flashcards found for book %s\n", book.MenuTitle)
+		return nil
+	} else {
+		fileName := fmt.Sprintf("output/%s.txt", book.MenuTitle)
+		err = os.WriteFile(fileName, []byte(fileOutput.String()), 0644)
 		if err != nil {
 			return err
 		}
-		var chapterCards []*Card
-		for _, section := range sections {
-			fmt.Printf("  %+v\n", section.MenuTitle)
-			modes, err := GetMenu(section.MenuID)
-			if err != nil {
-				return err
-			}
-			for _, mode := range modes {
-				if mode.MenuTitle == FlashCardsStudyMode {
-					cards, err := GetFlashCards(mode.MenuID)
-					if err != nil {
-						return err
-					}
-					for _, card := range cards {
-						if strings.Contains(card.SideA, "\r\n") {
-							// There is a broken card in the Spanish course that totally mangles the output.
-							// Handle that card correctly. There are several cards combined into one message, this will
-							// actually put them in the output correctly.
-							parts := strings.Split(card.SideA, "\r\n")
-							for _, part := range parts[1:] {
-								aAndB := strings.Split(part, "\t")
-								if len(aAndB) == 2 {
-									chapterCards = append(chapterCards, &Card{
-										SideA: aAndB[0],
-										SideB: aAndB[1],
-									})
-								}
-							}
-							continue
-						}
-						chapterCards = append(chapterCards, card)
-					}
-				}
-			}
-		}
-		if len(chapterCards) == 0 {
-			continue
-		}
-		for _, card := range chapterCards {
-			title := chapter.MenuTitle
-			if chapter.MenuTitle[2:4] == ". " {
-				title = chapter.MenuTitle[0:4] + "(" + Language[0:1] + "2E) " + chapter.MenuTitle[4:]
-			}
-			fileOutput.WriteString(fmt.Sprintf("%s\t%s\t%s %s\n", card.SideA, card.SideB, BookName, title))
-		}
-		for _, card := range chapterCards {
-			title := chapter.MenuTitle
-			if chapter.MenuTitle[2:4] == ". " {
-				title = chapter.MenuTitle[0:4] + "(E2" + Language[0:1] + ") " + chapter.MenuTitle[4:]
-			}
-			fileOutput.WriteString(fmt.Sprintf("%s\t%s\t%s %s\n", card.SideB, card.SideA, BookName, title))
-		}
-	}
-	fileName := fmt.Sprintf("output/%s.tsv", BookName)
-	err = os.WriteFile(fileName, []byte(fileOutput.String()), 0644)
-	if err != nil {
-		return err
-	}
 
-	fmt.Printf("File written to %s\n", fileName)
+		fmt.Printf("File written to %s\n", fileName)
+	}
 
 	return nil
 }
-func GetMenu(parentID int) ([]*MenuEntry, error) {
+
+func GetChapterCards(chapter *MenuEntry) ([]*Card, error) {
+	fmt.Printf("  %+v\n", chapter.MenuTitle)
+	var chapterCards []*Card
+	if chapter.FlashCardsAndQuiz {
+		// If this chapter is the bottom of the graph, get the flashcards.
+		flashCardMode, err := GetMenuOptionWithNames(chapter.MenuID, FlashCardsStudyMode)
+		if err != nil {
+			return nil, err
+		}
+		if flashCardMode == nil {
+			fmt.Printf("Chapter %s does not have flashcard mode", chapter.MenuTitle)
+			return nil, nil
+		}
+		cards, err := GetFlashCards(flashCardMode.MenuID)
+		if err != nil {
+			return nil, err
+		}
+		for _, card := range cards {
+			if strings.Contains(card.SideA, "\r\n") {
+				// There is a broken card in the Spanish course that totally mangles the output.
+				// Handle that card correctly. There are several cards combined into one message, this will
+				// actually put them in the output correctly.
+				parts := strings.Split(card.SideA, "\r\n")
+				for _, part := range parts[1:] {
+					aAndB := strings.Split(part, "\t")
+					if len(aAndB) == 2 {
+						chapterCards = append(chapterCards, &Card{
+							SideA: aAndB[0],
+							SideB: aAndB[1],
+						})
+					}
+				}
+				continue
+			} else {
+				card.SideA = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(card.SideA, "\t", ""), "\n", ""), "\r", ""), "\n", "")
+				card.SideB = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(card.SideB, "\t", ""), "\n", ""), "\r", ""), "\n", "")
+			}
+
+			chapterCards = append(chapterCards, card)
+		}
+	} else {
+		// If this chapter has subchapters, get the flashcards for each subchapter.
+		subChapters, err := GetMenuOptions(chapter.MenuID)
+		if err != nil {
+			return nil, err
+		}
+		for _, subChapter := range subChapters {
+			subChapterCards, err := GetChapterCards(subChapter)
+			if err != nil {
+				return nil, err
+			}
+			chapterCards = append(chapterCards, subChapterCards...)
+		}
+	}
+	return chapterCards, nil
+}
+
+func GetMenuOptions(parentID int) ([]*MenuEntry, error) {
 	resp, err := http.Get(fmt.Sprintf(GetMenuUrl, parentID))
 	if err != nil {
 		return nil, err
@@ -176,6 +216,21 @@ func GetMenu(parentID int) ([]*MenuEntry, error) {
 		return nil, err
 	}
 	return getMenuResponse, nil
+}
+
+func GetMenuOptionWithNames(parentID int, names ...string) (*MenuEntry, error) {
+	options, err := GetMenuOptions(parentID)
+	if err != nil {
+		return nil, err
+	}
+	for _, option := range options {
+		for _, name := range names {
+			if option.MenuTitle == name {
+				return option, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 func GetFlashCards(menuID int) ([]*Card, error) {
